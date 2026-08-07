@@ -1,0 +1,807 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="theme-color" content="#0a0c14">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>ケイドロ プロトタイプ v0.1</title>
+<style>
+  html, body {
+    margin: 0; padding: 0; height: 100%; overflow: hidden;
+    background: #0a0c14; color: #cdd6e6;
+    font-family: "Hiragino Sans", "Yu Gothic", system-ui, sans-serif;
+    display: flex; flex-direction: column;
+    align-items: center; justify-content: center;
+    gap: 10px;
+    -webkit-user-select: none; user-select: none;
+    -webkit-tap-highlight-color: transparent;
+    overscroll-behavior: none;
+  }
+  /* 画面に収まるよう縦横比を保ったまま伸縮させる */
+  #wrap {
+    position: relative;
+    width: min(100vw, calc((100dvh - 34px) * 960 / 728));
+    aspect-ratio: 960 / 728;
+    touch-action: none;
+  }
+  canvas {
+    display: block; width: 100%; height: 100%;
+    image-rendering: pixelated;
+    border-radius: 6px; box-shadow: 0 8px 40px rgba(0,0,0,.6);
+  }
+  .note { font-size: 12px; color: #66718a; letter-spacing: .04em; text-align: center; padding: 0 8px; }
+
+  /* --- タッチ操作。指が乗る端末でだけ出す --- */
+  #touch { position: absolute; inset: 0; display: none; }
+  body.touch #touch { display: block; }
+  #stick, #knob, #dash {
+    position: absolute; border-radius: 50%; pointer-events: none;
+    box-sizing: border-box;
+  }
+  #stick {
+    width: 30%; aspect-ratio: 1; border: 2px solid rgba(150,180,255,.30);
+    background: rgba(20,28,48,.30); opacity: 0; transition: opacity .12s;
+    transform: translate(-50%, -50%);
+  }
+  #stick.on { opacity: 1; }
+  #knob {
+    width: 13%; aspect-ratio: 1; background: rgba(120,170,255,.55);
+    border: 2px solid rgba(200,225,255,.8);
+    transform: translate(-50%, -50%); opacity: 0; transition: opacity .12s;
+  }
+  #knob.on { opacity: 1; }
+  #dash {
+    right: 4%; bottom: 5%; width: 20%; aspect-ratio: 1;
+    background: rgba(30,45,75,.5); border: 2px solid rgba(150,180,255,.45);
+    display: flex; align-items: center; justify-content: center;
+    color: #9fd0ff; font-size: 3.2vw; font-weight: bold; letter-spacing: .05em;
+  }
+  #dash.on { background: rgba(78,163,255,.55); border-color: #cfe6ff; color: #fff; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="cv" width="960" height="728"></canvas>
+  <div id="touch">
+    <div id="stick"></div>
+    <div id="knob"></div>
+    <div id="dash">走る</div>
+  </div>
+</div>
+<div class="note">WASD / 矢印キー：移動　　Shift：ダッシュ　　R：リスタート</div>
+
+<script>
+'use strict';
+
+// ---------------------------------------------------------------------------
+// 調整パラメータ（プロトタイプの目的は数値を触って感触を確かめること）
+// ---------------------------------------------------------------------------
+const T = {
+  timeLimit: 180,        // 制限時間（秒）
+  // 速度設計：素の足は警察が速い（長期戦なら必ず追いつく）が、
+  // ダッシュ中だけは泥棒が速い（短期的には振り切れる）。決着はスタミナがつける。
+  copSpeed: 132,         // 警察の基本速度（px/秒）
+  copDash: 190,          // 警察のダッシュ速度
+  copDashTime: 4.0,      // ダッシュ持続（秒）
+  copRecover: 5.0,       // スタミナ全回復（秒）
+  thiefSpeed: 122,       // 泥棒の基本速度
+  thiefDash: 204,        // 泥棒のダッシュ速度
+  thiefDashTime: 3.0,
+  thiefRecover: 6.0,
+  // スタミナが尽きたら息切れ状態になり、この割合まで戻るまで再ダッシュできない
+  exhaustThreshold: 0.35,
+  markDuration: 3.0,     // エリアを出た泥棒が見え続ける秒数
+  // 泥棒の3状態：遠い＝徘徊 / 気配を感じる＝距離を取る / 見つかった＝全力逃走
+  noticeRange: 7,        // 逃走に切り替わる距離（マス／通路沿い）
+  awareRange: 16,        // 気配を感じて距離を取り始める距離
+  fleeMemory: 3.0,       // 見失ってから逃走をやめるまでの秒数
+  catchDist: 15,         // 収監が成立する距離（px）
+  repathInterval: 0.4,   // 逃走先を選び直す間隔（秒）
+  avoidRepath: 0.8,      // 回避先を見直す間隔（秒）
+  wanderRepath: 1.5,     // 徘徊先を見直す間隔（秒）
+};
+
+// ---------------------------------------------------------------------------
+// マップ（30×21マス＝3×3エリア、1エリア＝10×7マス）
+// ---------------------------------------------------------------------------
+const MAP = [
+  '##############################',
+  '#............#...............#',
+  '#.####.####..#..####..#####..#',
+  '#.#.......#..#..#..........#.#',
+  '#.#.####..#.....#..####..#.#.#',
+  '#...#..#..######...#..#..#...#',
+  '#####..#.......#...#..####.###',
+  '#......#..###..#...#.......#.#',
+  '#..#####..#....#####..####.#.#',
+  '#..#......#.........#....#...#',
+  '#..#..#####..#####..#.##.#.###',
+  '#.....#......#...#..#.#..#...#',
+  '####..#..#####...#..#.#..###.#',
+  '#.....#..#.......#....#......#',
+  '#..####..#..######..###..###.#',
+  '#..#.....#.......#..#....#...#',
+  '#..#..####..####.#..#..###.#.#',
+  '#.....#.....#....#..#......#.#',
+  '#..####..####..###..#####..#.#',
+  '#..........#...............#.#',
+  '##############################',
+];
+
+const TILE = 32;
+const MW = MAP[0].length, MH = MAP.length;      // 30 x 21
+const FIELD_W = MW * TILE, FIELD_H = MH * TILE; // 960 x 672
+const HUD_H = 56;
+
+const AW = MW / 3, AH = MH / 3;                  // エリア 10 x 7 マス
+const AREA_NAMES = [
+  ['北西', '北', '北東'],
+  ['西',   '中央', '東'],
+  ['南西', '南', '南東'],
+];
+
+const JAIL = { c0: 25, r0: 17, c1: 26, r1: 19 }; // 南東エリアの隅
+const PLAYER_START = { c: 22, r: 19 }; // 牢屋のある南東から出発する
+// 牢屋（南東）から遠い4エリアに1人ずつ散らす。固めると団子で一網打尽になる。
+const THIEF_STARTS = [{ c: 2, r: 1 }, { c: 15, r: 1 }, { c: 25, r: 1 }, { c: 5, r: 9 }];
+
+const solid = [];
+for (let r = 0; r < MH; r++) for (let c = 0; c < MW; c++) solid[r * MW + c] = MAP[r][c] === '#';
+
+const isWall = (c, r) => c < 0 || r < 0 || c >= MW || r >= MH || solid[r * MW + c];
+const tileIndex = (c, r) => r * MW + c;
+const areaOf = (x, y) => {
+  const ac = Math.min(2, Math.floor(x / (FIELD_W / 3)));
+  const ar = Math.min(2, Math.floor(y / (FIELD_H / 3)));
+  return ar * 3 + ac;
+};
+const centerOf = (c, r) => ({ x: c * TILE + TILE / 2, y: r * TILE + TILE / 2 });
+
+// 各床マスの「開放度」（隣接する床の数）。行き止まりを避けるために使う。
+const openness = new Array(MW * MH).fill(0);
+for (let r = 0; r < MH; r++) for (let c = 0; c < MW; c++) {
+  if (isWall(c, r)) continue;
+  let n = 0;
+  if (!isWall(c + 1, r)) n++;
+  if (!isWall(c - 1, r)) n++;
+  if (!isWall(c, r + 1)) n++;
+  if (!isWall(c, r - 1)) n++;
+  openness[tileIndex(c, r)] = n;
+}
+
+// ---------------------------------------------------------------------------
+// 経路探索（幅優先。630マスなので毎フレーム回しても軽い）
+// ---------------------------------------------------------------------------
+const DX = [1, -1, 0, 0], DY = [0, 0, 1, -1];
+const bfsQueue = new Int32Array(MW * MH);
+function bfs(startC, startR, out) {
+  out.fill(-1);
+  if (isWall(startC, startR)) return out;
+  let head = 0, tail = 0;
+  const s = tileIndex(startC, startR);
+  out[s] = 0;
+  bfsQueue[tail++] = s;
+  while (head < tail) {
+    const cur = bfsQueue[head++];
+    const cc = cur % MW, cr = (cur / MW) | 0, d = out[cur] + 1;
+    for (let i = 0; i < 4; i++) {
+      const nc = cc + DX[i], nr = cr + DY[i];
+      if (isWall(nc, nr)) continue;
+      const ni = tileIndex(nc, nr);
+      if (out[ni] !== -1) continue;
+      out[ni] = d;
+      bfsQueue[tail++] = ni;
+    }
+  }
+  return out;
+}
+
+const distFromCop = new Int32Array(MW * MH);
+const scratchDist = new Int32Array(MW * MH); // 逃走先の選定に使い回す
+
+// ---------------------------------------------------------------------------
+// 当たり判定（円をAABBで近似。軸ごとに動かして壁ずりを効かせる）
+// ---------------------------------------------------------------------------
+const RADIUS = 9;          // 描画サイズと揃える。これより太いと見た目より引っかかる
+const CORNER_ASSIST = 13;  // 角を曲がるとき、通路の口へ自動で寄せてやる最大幅（px）
+const CORNER_SLIDE = 2.2;  // 寄せる速さの倍率。小さいと曲がりだしが重く、大きいと滑る
+
+function blocked(x, y) {
+  const c0 = Math.floor((x - RADIUS) / TILE), c1 = Math.floor((x + RADIUS) / TILE);
+  const r0 = Math.floor((y - RADIUS) / TILE), r1 = Math.floor((y + RADIUS) / TILE);
+  for (let r = r0; r <= r1; r++) for (let c = c0; c <= c1; c++) if (isWall(c, r)) return true;
+  return false;
+}
+
+// 通路幅32pxに対し判定は直径18px。素直に軸分離で当てると、曲がれる帯が
+// 14pxしかなく角に刺さる。進みたい方向が塞がれていても、垂直に少しずらせば
+// 通れる場合はそちらへ寄せることで、曲がり角を曲がりやすくする。
+function slideAssist(e, dx, dy, axis) {
+  const speed = Math.hypot(dx, dy);
+  for (let off = 1; off <= CORNER_ASSIST; off++) {
+    for (const sign of [-1, 1]) {
+      const ok = axis === 'x'
+        ? !blocked(e.x + dx, e.y + sign * off)
+        : !blocked(e.x + sign * off, e.y + dy);
+      if (!ok) continue;
+      const step = sign * Math.min(speed * CORNER_SLIDE, off);
+      if (axis === 'x') { if (!blocked(e.x, e.y + step)) e.y += step; }
+      else { if (!blocked(e.x + step, e.y)) e.x += step; }
+      return;
+    }
+  }
+}
+
+// 通路を直進している間、入力のない側を通路の中心へ寄せる。
+// 角に着いた時点で位置が揃っているので、曲がるのに失敗しなくなる。
+// 開けた場所では効かせない（吸い付く感触になるため）。
+const CENTER_ASSIST = 0.55; // 移動速度に対する寄せ速度の比
+function centerAssist(e, dx, dy) {
+  const c = Math.floor(e.x / TILE), r = Math.floor(e.y / TILE);
+  const rate = Math.hypot(dx, dy) * CENTER_ASSIST;
+  if (dx && !dy) {
+    if (!isWall(c, r - 1) && !isWall(c, r + 1)) return;
+    const d = r * TILE + TILE / 2 - e.y;
+    if (Math.abs(d) < 0.5) return;
+    const step = Math.sign(d) * Math.min(rate, Math.abs(d));
+    if (!blocked(e.x, e.y + step)) e.y += step;
+  } else if (dy && !dx) {
+    if (!isWall(c - 1, r) && !isWall(c + 1, r)) return;
+    const d = c * TILE + TILE / 2 - e.x;
+    if (Math.abs(d) < 0.5) return;
+    const step = Math.sign(d) * Math.min(rate, Math.abs(d));
+    if (!blocked(e.x + step, e.y)) e.x += step;
+  }
+}
+
+function moveEntity(e, dx, dy) {
+  if (dx) {
+    if (!blocked(e.x + dx, e.y)) e.x += dx;
+    else slideAssist(e, dx, 0, 'x');
+  }
+  if (dy) {
+    if (!blocked(e.x, e.y + dy)) e.y += dy;
+    else slideAssist(e, 0, dy, 'y');
+  }
+  centerAssist(e, dx, dy);
+}
+
+// ---------------------------------------------------------------------------
+// ゲーム状態
+// ---------------------------------------------------------------------------
+let cop, thieves, timeLeft, phase, effects, elapsed;
+
+function reset() {
+  const p = centerOf(PLAYER_START.c, PLAYER_START.r);
+  cop = { x: p.x, y: p.y, stamina: 1, exhausted: false, dashing: false, facing: 0 };
+  thieves = THIEF_STARTS.map((s, i) => {
+    const c = centerOf(s.c, s.r);
+    return {
+      id: i, x: c.x, y: c.y,
+      stamina: 1, exhausted: false, jailed: false,
+      state: 'wander',       // wander | flee
+      fleeTimer: 0,
+      mark: 0,               // エリア外でも見え続ける残り秒数
+      goal: null,            // 目標マス
+      goalDist: new Int32Array(MW * MH),
+      repath: 0,
+    };
+  });
+  timeLeft = T.timeLimit;
+  elapsed = 0;
+  phase = 'play';            // play | win | lose
+  effects = [];
+}
+
+// ---------------------------------------------------------------------------
+// 入力
+// ---------------------------------------------------------------------------
+const keys = Object.create(null);
+addEventListener('keydown', e => {
+  keys[e.code] = true;
+  if (e.code === 'KeyR') reset();
+  if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Space'].includes(e.code)) e.preventDefault();
+});
+addEventListener('keyup', e => { keys[e.code] = false; });
+addEventListener('blur', () => { for (const k in keys) keys[k] = false; });
+
+const held = (...codes) => codes.some(c => keys[c]);
+
+// --- タッチ操作 -------------------------------------------------------------
+// 左半分：触った位置に仮想スティックが出る。右下：ダッシュボタン。
+const pad = { active: false, x: 0, y: 0, dash: false };
+const wrapEl = document.getElementById('wrap');
+const stickEl = document.getElementById('stick');
+const knobEl = document.getElementById('knob');
+const dashEl = document.getElementById('dash');
+const STICK_RANGE = 0.11;   // 画面幅に対する、最大入力になるまでの距離
+const STICK_DEAD = 0.022;   // 遊び
+
+const isTouch = matchMedia('(pointer: coarse)').matches || 'ontouchstart' in window;
+if (isTouch) {
+  document.body.classList.add('touch');
+  document.querySelector('.note').textContent = '左側をなぞって移動　　「走る」でダッシュ　　結果画面をタップでリスタート';
+}
+
+let stickId = null, dashId = null, origin = null;
+
+function localPos(t) {
+  const r = wrapEl.getBoundingClientRect();
+  return { x: (t.clientX - r.left) / r.width, y: (t.clientY - r.top) / r.height, w: r.width };
+}
+function inDashButton(p) {
+  // CSS上のダッシュボタン（右4%・下5%・幅20%）に指が乗ったか
+  const ar = 960 / 728;
+  const bw = 0.20, bh = bw * ar;
+  return p.x > 1 - 0.04 - bw && p.y > 1 - 0.05 - bh;
+}
+function applyStick(p) {
+  const dx = (p.x - origin.x), dy = (p.y - origin.y) / (728 / 960); // 縦横比を揃える
+  const len = Math.hypot(dx, dy);
+  if (len < STICK_DEAD) { pad.active = false; knobEl.classList.remove('on'); return; }
+  const k = Math.min(1, len / STICK_RANGE);
+  pad.active = true;
+  pad.x = dx / len; pad.y = dy / len;
+  knobEl.classList.add('on');
+  knobEl.style.left = (origin.x + pad.x * STICK_RANGE * k) * 100 + '%';
+  knobEl.style.top = (origin.y + pad.y * STICK_RANGE * k * (728 / 960)) * 100 + '%';
+}
+
+wrapEl.addEventListener('touchstart', ev => {
+  ev.preventDefault();
+  if (phase !== 'play') { reset(); return; }
+  for (const t of ev.changedTouches) {
+    const p = localPos(t);
+    if (dashId === null && inDashButton(p)) {
+      dashId = t.identifier; pad.dash = true; dashEl.classList.add('on');
+    } else if (stickId === null) {
+      stickId = t.identifier; origin = p;
+      stickEl.style.left = p.x * 100 + '%';
+      stickEl.style.top = p.y * 100 + '%';
+      stickEl.classList.add('on');
+      applyStick(p);
+    }
+  }
+}, { passive: false });
+
+wrapEl.addEventListener('touchmove', ev => {
+  ev.preventDefault();
+  for (const t of ev.changedTouches) {
+    if (t.identifier === stickId) applyStick(localPos(t));
+  }
+}, { passive: false });
+
+function endTouch(ev) {
+  ev.preventDefault();
+  for (const t of ev.changedTouches) {
+    if (t.identifier === stickId) {
+      stickId = null; origin = null; pad.active = false;
+      stickEl.classList.remove('on'); knobEl.classList.remove('on');
+    }
+    if (t.identifier === dashId) {
+      dashId = null; pad.dash = false; dashEl.classList.remove('on');
+    }
+  }
+}
+wrapEl.addEventListener('touchend', endTouch, { passive: false });
+wrapEl.addEventListener('touchcancel', endTouch, { passive: false });
+
+// マウスでも結果画面をクリックでリスタートできるようにしておく
+wrapEl.addEventListener('pointerdown', ev => {
+  if (ev.pointerType !== 'touch' && phase !== 'play') reset();
+});
+
+// ---------------------------------------------------------------------------
+// 更新
+// ---------------------------------------------------------------------------
+function updateCop(dt) {
+  let dx = 0, dy = 0;
+  if (held('KeyA', 'ArrowLeft')) dx -= 1;
+  if (held('KeyD', 'ArrowRight')) dx += 1;
+  if (held('KeyW', 'ArrowUp')) dy -= 1;
+  if (held('KeyS', 'ArrowDown')) dy += 1;
+  if (!dx && !dy && pad.active) { dx = pad.x; dy = pad.y; }
+
+  const moving = dx || dy;
+  const wantDash = (held('ShiftLeft', 'ShiftRight') || pad.dash) && moving && !cop.exhausted && cop.stamina > 0;
+  cop.dashing = wantDash;
+
+  if (wantDash) {
+    cop.stamina = Math.max(0, cop.stamina - dt / T.copDashTime);
+    if (cop.stamina === 0) cop.exhausted = true;
+  } else {
+    cop.stamina = Math.min(1, cop.stamina + dt / T.copRecover);
+    if (cop.stamina >= T.exhaustThreshold) cop.exhausted = false;
+  }
+
+  if (moving) {
+    const len = Math.hypot(dx, dy);
+    const sp = (wantDash ? T.copDash : T.copSpeed) * dt;
+    moveEntity(cop, (dx / len) * sp, (dy / len) * sp);
+    cop.facing = Math.atan2(dy, dx);
+  }
+}
+
+// 逃走先を選ぶ：警察から遠く、自分からは近く、行き止まりでないマス。
+function pickFleeGoal(t) {
+  const tc = Math.floor(t.x / TILE), tr = Math.floor(t.y / TILE);
+  const fromThief = bfs(tc, tr, scratchDist);
+  const copArea = areaOf(cop.x, cop.y);
+  let best = -Infinity, goal = null;
+  for (let r = 0; r < MH; r++) for (let c = 0; c < MW; c++) {
+    const i = tileIndex(c, r);
+    if (isWall(c, r) || fromThief[i] < 0) continue;
+    const dCop = distFromCop[i] < 0 ? 0 : distFromCop[i];
+    // 行き止まりは追い詰められるので強く避ける
+    const penalty = openness[i] <= 1 ? 15 : 0;
+    // 警察のいるエリアから出ることを優先する（視界を切るのが最大の防御）
+    const escape = areaOf(c * TILE + TILE / 2, r * TILE + TILE / 2) !== copArea ? 4 : 0;
+    const score = dCop + escape - fromThief[i] * 0.25 - penalty + Math.random() * 1.5;
+    if (score > best) { best = score; goal = { c, r }; }
+  }
+  return goal;
+}
+
+// 徘徊先：警察から十分離れていて、警察のいるエリアでもないマス。
+// ここを無条件のランダムにすると、泥棒が自分から警察に歩いてきて索敵が成立しない。
+function pickWanderGoal(t) {
+  const copArea = areaOf(cop.x, cop.y);
+  let fallback = null;
+  for (let tries = 0; tries < 80; tries++) {
+    const c = (Math.random() * MW) | 0, r = (Math.random() * MH) | 0;
+    const i = tileIndex(c, r);
+    if (isWall(c, r) || openness[i] <= 1) continue;
+    const dCop = distFromCop[i];
+    if (dCop >= 0 && dCop < T.noticeRange) continue;
+    if (!fallback) fallback = { c, r };
+    if (dCop >= 0 && dCop < T.awareRange) continue;
+    if (areaOf(c * TILE + TILE / 2, r * TILE + TILE / 2) === copArea) continue;
+    return { c, r };
+  }
+  return fallback;
+}
+
+function setGoal(t, goal) {
+  t.goal = goal;
+  if (goal) bfs(goal.c, goal.r, t.goalDist);
+}
+
+function updateThief(t, dt) {
+  if (t.jailed) return;
+
+  const tc = Math.floor(t.x / TILE), tr = Math.floor(t.y / TILE);
+  const dCop = distFromCop[tileIndex(tc, tr)];
+  const noticed = dCop >= 0 && dCop <= T.noticeRange;
+  const sensed = dCop >= 0 && dCop <= T.awareRange;
+
+  const prev = t.state;
+  if (noticed) {
+    t.state = 'flee';
+    t.fleeTimer = T.fleeMemory;
+  } else if (t.state === 'flee') {
+    t.fleeTimer -= dt;
+    if (t.fleeTimer <= 0) t.state = sensed ? 'avoid' : 'wander';
+  } else {
+    t.state = sensed ? 'avoid' : 'wander';
+  }
+  if (t.state !== prev) t.goal = null;
+
+  // 目標の更新
+  t.repath -= dt;
+  const reached = t.goal && Math.floor(t.x / TILE) === t.goal.c && Math.floor(t.y / TILE) === t.goal.r;
+  if (!t.goal || reached || t.repath <= 0) {
+    setGoal(t, t.state === 'wander' ? pickWanderGoal(t) : pickFleeGoal(t));
+    t.repath = t.state === 'flee' ? T.repathInterval
+             : t.state === 'avoid' ? T.avoidRepath : T.wanderRepath;
+  }
+
+  // スタミナ：全力逃走のときだけダッシュを使う。回避は歩いて距離を取るだけ。
+  const wantDash = t.state === 'flee' && !t.exhausted && t.stamina > 0;
+  if (wantDash) {
+    t.stamina = Math.max(0, t.stamina - dt / T.thiefDashTime);
+    if (t.stamina === 0) t.exhausted = true;
+  } else {
+    t.stamina = Math.min(1, t.stamina + dt / T.thiefRecover);
+    if (t.stamina >= T.exhaustThreshold) t.exhausted = false;
+  }
+  const speed = (wantDash ? T.thiefDash : T.thiefSpeed) * dt;
+
+  // 目標へ向かう：距離場の勾配で操舵する。
+  // マス中心を順に辿らせると角を斜めに抜けられず、警察に一方的に詰められてしまう。
+  if (t.goal) {
+    const here = t.goalDist[tileIndex(tc, tr)];
+    let vx = 0, vy = 0;
+    if (here >= 0) {
+      for (let i = 0; i < 4; i++) {
+        const cc = tc + DX[i], cr = tr + DY[i];
+        if (isWall(cc, cr)) continue;
+        const d = t.goalDist[tileIndex(cc, cr)];
+        if (d < 0) continue;
+        const w = here - d;               // 下り方向の強さ
+        if (w > 0) { vx += DX[i] * w; vy += DY[i] * w; }
+      }
+    }
+    const g = Math.hypot(vx, vy);
+    const c0 = centerOf(tc, tr);
+    // 進行方向1マス先を狙う。通路の中心に戻す力も同時に働く。
+    const aimX = g > 0 ? c0.x + (vx / g) * TILE : c0.x;
+    const aimY = g > 0 ? c0.y + (vy / g) * TILE : c0.y;
+    const sx = aimX - t.x, sy = aimY - t.y;
+    const len = Math.hypot(sx, sy);
+    if (len > 0.5) moveEntity(t, (sx / len) * speed, (sy / len) * speed);
+  }
+
+  // 収監判定
+  if (Math.hypot(t.x - cop.x, t.y - cop.y) < T.catchDist) jail(t);
+}
+
+function jail(t) {
+  t.jailed = true;
+  t.mark = 0;
+  effects.push({ x: t.x, y: t.y, life: 0.5, max: 0.5 });
+  const slot = thieves.filter(o => o.jailed).length - 1;
+  const c = JAIL.c0 + (slot % 2), r = JAIL.r0 + Math.floor(slot / 2);
+  const p = centerOf(c, r);
+  t.x = p.x; t.y = p.y;
+}
+
+function update(dt) {
+  if (phase !== 'play') return;
+
+  elapsed += dt;
+  timeLeft -= dt;
+
+  updateCop(dt);
+  bfs(Math.floor(cop.x / TILE), Math.floor(cop.y / TILE), distFromCop);
+
+  const copArea = areaOf(cop.x, cop.y);
+  for (const t of thieves) {
+    updateThief(t, dt);
+    if (!t.jailed) {
+      // 同エリアにいれば見える。出た後も markDuration 秒は輪郭が残る。
+      if (areaOf(t.x, t.y) === copArea) t.mark = T.markDuration;
+      else t.mark = Math.max(0, t.mark - dt);
+    }
+  }
+
+  for (const e of effects) e.life -= dt;
+  effects = effects.filter(e => e.life > 0);
+
+  if (thieves.every(t => t.jailed)) phase = 'win';
+  else if (timeLeft <= 0) { timeLeft = 0; phase = 'lose'; }
+}
+
+// ---------------------------------------------------------------------------
+// 描画
+// ---------------------------------------------------------------------------
+const cv = document.getElementById('cv');
+const ctx = cv.getContext('2d');
+
+function drawMap() {
+  ctx.fillStyle = '#161b28';
+  ctx.fillRect(0, 0, FIELD_W, FIELD_H);
+  for (let r = 0; r < MH; r++) for (let c = 0; c < MW; c++) {
+    const x = c * TILE, y = r * TILE;
+    if (isWall(c, r)) {
+      ctx.fillStyle = '#333c55';
+      ctx.fillRect(x, y, TILE, TILE);
+      ctx.fillStyle = '#3f4a68';
+      ctx.fillRect(x, y, TILE, 3);
+    } else {
+      ctx.fillStyle = (c + r) % 2 ? '#1b2130' : '#1e2434';
+      ctx.fillRect(x, y, TILE, TILE);
+    }
+  }
+}
+
+function drawJail() {
+  const x = JAIL.c0 * TILE, y = JAIL.r0 * TILE;
+  const w = (JAIL.c1 - JAIL.c0 + 1) * TILE, h = (JAIL.r1 - JAIL.r0 + 1) * TILE;
+  ctx.fillStyle = 'rgba(120,150,220,.12)';
+  ctx.fillRect(x, y, w, h);
+  ctx.strokeStyle = 'rgba(150,180,255,.5)';
+  ctx.lineWidth = 2;
+  ctx.strokeRect(x + 1, y + 1, w - 2, h - 2);
+  ctx.fillStyle = 'rgba(170,195,255,.55)';
+  ctx.font = '10px system-ui';
+  ctx.textAlign = 'center';
+  ctx.fillText('牢屋', x + w / 2, y - 5);
+}
+
+function drawFog(copArea) {
+  const aw = FIELD_W / 3, ah = FIELD_H / 3;
+  for (let a = 0; a < 9; a++) {
+    if (a === copArea) continue;
+    const ax = (a % 3) * aw, ay = Math.floor(a / 3) * ah;
+    ctx.fillStyle = 'rgba(6,8,16,.78)';
+    ctx.fillRect(ax, ay, aw, ah);
+  }
+  // エリア境界
+  ctx.strokeStyle = 'rgba(120,140,190,.16)';
+  ctx.lineWidth = 1;
+  for (let i = 1; i < 3; i++) {
+    ctx.beginPath(); ctx.moveTo(i * aw, 0); ctx.lineTo(i * aw, FIELD_H); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(0, i * ah); ctx.lineTo(FIELD_W, i * ah); ctx.stroke();
+  }
+  // 現在エリアを縁取り
+  const cx = (copArea % 3) * aw, cy = Math.floor(copArea / 3) * ah;
+  ctx.strokeStyle = 'rgba(140,190,255,.35)';
+  ctx.lineWidth = 2;
+  ctx.strokeRect(cx + 1, cy + 1, aw - 2, ah - 2);
+}
+
+function drawThief(t, copArea) {
+  if (t.jailed) {
+    ctx.fillStyle = '#5d667e'; // 収監済みは灰色。エリア外でも常に見える
+    ctx.beginPath(); ctx.arc(t.x, t.y, 7, 0, Math.PI * 2); ctx.fill();
+    return;
+  }
+  const inArea = areaOf(t.x, t.y) === copArea;
+  if (inArea) {
+    ctx.fillStyle = '#ff7a45';
+    ctx.beginPath(); ctx.arc(t.x, t.y, 8, 0, Math.PI * 2); ctx.fill();
+    ctx.strokeStyle = 'rgba(255,190,150,.9)'; ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.arc(t.x, t.y, 8, 0, Math.PI * 2); ctx.stroke();
+    // 状態を読ませる：! = 全力逃走中、? = こちらの気配に気づいて距離を取っている
+    if (t.state === 'flee' || t.state === 'avoid') {
+      ctx.fillStyle = t.state === 'flee' ? '#ffd35c' : '#8b97b0';
+      ctx.font = 'bold 13px system-ui';
+      ctx.textAlign = 'center';
+      ctx.fillText(t.state === 'flee' ? '!' : '?', t.x, t.y - 13);
+    }
+  } else if (t.mark > 0) {
+    // フォグ越しに輪郭だけ残る（マーク状態）
+    const a = Math.min(1, t.mark / T.markDuration) * .85;
+    ctx.strokeStyle = `rgba(255,90,60,${a})`;
+    ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(t.x, t.y, 9, 0, Math.PI * 2); ctx.stroke();
+  }
+}
+
+function drawCop() {
+  ctx.fillStyle = '#4ea3ff';
+  ctx.beginPath(); ctx.arc(cop.x, cop.y, 9, 0, Math.PI * 2); ctx.fill();
+  ctx.strokeStyle = '#cfe6ff'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.arc(cop.x, cop.y, 9, 0, Math.PI * 2); ctx.stroke();
+  // 向き
+  ctx.strokeStyle = '#cfe6ff'; ctx.lineWidth = 3;
+  ctx.beginPath();
+  ctx.moveTo(cop.x, cop.y);
+  ctx.lineTo(cop.x + Math.cos(cop.facing) * 14, cop.y + Math.sin(cop.facing) * 14);
+  ctx.stroke();
+}
+
+function drawEffects() {
+  for (const e of effects) {
+    const p = 1 - e.life / e.max;
+    ctx.strokeStyle = `rgba(255,220,120,${1 - p})`;
+    ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.arc(e.x, e.y, 10 + p * 26, 0, Math.PI * 2); ctx.stroke();
+  }
+}
+
+function drawHUD(copArea) {
+  ctx.fillStyle = '#10131d';
+  ctx.fillRect(0, 0, FIELD_W, HUD_H);
+  ctx.fillStyle = '#242c40';
+  ctx.fillRect(0, HUD_H - 1, FIELD_W, 1);
+
+  const caught = thieves.filter(t => t.jailed).length;
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'middle';
+
+  ctx.fillStyle = '#8b97b0';
+  ctx.font = '11px system-ui';
+  ctx.fillText('収監', 20, 18);
+  ctx.fillStyle = caught === 4 ? '#7dffa8' : '#e8eefc';
+  ctx.font = 'bold 24px system-ui';
+  ctx.fillText(`${caught} / 4`, 20, 37);
+
+  const m = Math.floor(timeLeft / 60), s = Math.floor(timeLeft % 60);
+  ctx.fillStyle = '#8b97b0';
+  ctx.font = '11px system-ui';
+  ctx.fillText('残り時間', 120, 18);
+  ctx.fillStyle = timeLeft < 30 ? '#ff7a6a' : '#e8eefc';
+  ctx.font = 'bold 24px system-ui';
+  ctx.fillText(`${m}:${String(s).padStart(2, '0')}`, 120, 37);
+
+  ctx.fillStyle = '#8b97b0';
+  ctx.font = '11px system-ui';
+  ctx.fillText('現在エリア', 232, 18);
+  ctx.fillStyle = '#9fd0ff';
+  ctx.font = 'bold 20px system-ui';
+  ctx.fillText(AREA_NAMES[Math.floor(copArea / 3)][copArea % 3], 232, 38);
+
+  // スタミナ
+  ctx.fillStyle = '#8b97b0';
+  ctx.font = '11px system-ui';
+  ctx.fillText('スタミナ', 340, 18);
+  ctx.fillStyle = '#232b3d';
+  ctx.fillRect(340, 30, 180, 12);
+  ctx.fillStyle = cop.exhausted ? '#ff7a6a' : '#4ea3ff';
+  ctx.fillRect(340, 30, 180 * cop.stamina, 12);
+  if (cop.exhausted) {
+    // 再ダッシュ可能になるラインを示す
+    ctx.fillStyle = '#ffd35c';
+    ctx.fillRect(340 + 180 * T.exhaustThreshold - 1, 28, 2, 16);
+  }
+
+  // 視認中の泥棒
+  const visible = thieves.filter(t => !t.jailed && (areaOf(t.x, t.y) === copArea || t.mark > 0)).length;
+  ctx.fillStyle = '#8b97b0';
+  ctx.font = '11px system-ui';
+  ctx.fillText('視認中', 560, 18);
+  ctx.fillStyle = visible ? '#ff9a6a' : '#4d566d';
+  ctx.font = 'bold 24px system-ui';
+  ctx.fillText(String(visible), 560, 37);
+
+  ctx.fillStyle = '#4d566d';
+  ctx.font = '11px system-ui';
+  ctx.textAlign = 'right';
+  ctx.fillText('ケイドロ プロトタイプ v0.1　—　第1段階：移動・エリア可視・追跡・収監', FIELD_W - 20, 28);
+}
+
+function drawResult() {
+  if (phase === 'play') return;
+  ctx.fillStyle = 'rgba(6,8,16,.82)';
+  ctx.fillRect(0, 0, FIELD_W, FIELD_H);
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  if (phase === 'win') {
+    ctx.fillStyle = '#7dffa8';
+    ctx.font = 'bold 46px system-ui';
+    ctx.fillText('全員収監', FIELD_W / 2, FIELD_H / 2 - 40);
+    ctx.fillStyle = '#cdd6e6';
+    ctx.font = '18px system-ui';
+    ctx.fillText(`所要 ${elapsed.toFixed(1)} 秒　／　残り ${timeLeft.toFixed(1)} 秒`, FIELD_W / 2, FIELD_H / 2 + 8);
+  } else {
+    const caught = thieves.filter(t => t.jailed).length;
+    ctx.fillStyle = '#ff7a6a';
+    ctx.font = 'bold 46px system-ui';
+    ctx.fillText('時間切れ', FIELD_W / 2, FIELD_H / 2 - 40);
+    ctx.fillStyle = '#cdd6e6';
+    ctx.font = '18px system-ui';
+    ctx.fillText(`収監 ${caught} / 4`, FIELD_W / 2, FIELD_H / 2 + 8);
+  }
+  ctx.fillStyle = '#8b97b0';
+  ctx.font = '16px system-ui';
+  ctx.fillText(isTouch ? '画面をタップでリスタート' : 'R キーでリスタート', FIELD_W / 2, FIELD_H / 2 + 52);
+}
+
+function render() {
+  const copArea = areaOf(cop.x, cop.y);
+  ctx.clearRect(0, 0, cv.width, cv.height);
+  drawHUD(copArea);
+
+  ctx.save();
+  ctx.translate(0, HUD_H);
+  drawMap();
+  drawJail();
+  drawFog(copArea);
+  for (const t of thieves) drawThief(t, copArea);
+  drawCop();
+  drawEffects();
+  drawResult();
+  ctx.restore();
+}
+
+// ---------------------------------------------------------------------------
+// メインループ
+// ---------------------------------------------------------------------------
+let last = performance.now();
+function frame(now) {
+  const dt = Math.min(0.05, (now - last) / 1000);
+  last = now;
+  update(dt);
+  render();
+  requestAnimationFrame(frame);
+}
+
+reset();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

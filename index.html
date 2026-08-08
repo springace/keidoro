@@ -7,7 +7,7 @@
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-<title>ケイドロ プロトタイプ v0.1</title>
+<title>ケイドロ プロトタイプ v0.2</title>
 <style>
   html, body {
     margin: 0; padding: 0; height: 100%; overflow: hidden;
@@ -87,10 +87,10 @@ const T = {
   copDash: 190,          // 警察のダッシュ速度
   copDashTime: 4.0,      // ダッシュ持続（秒）
   copRecover: 5.0,       // スタミナ全回復（秒）
-  thiefSpeed: 122,       // 泥棒の基本速度
-  thiefDash: 204,        // 泥棒のダッシュ速度
-  thiefDashTime: 3.0,
-  thiefRecover: 6.0,
+  thiefSpeed: 119,       // 泥棒の基本速度
+  thiefDash: 200,        // 泥棒のダッシュ速度
+  thiefDashTime: 2.6,
+  thiefRecover: 7.0,
   // スタミナが尽きたら息切れ状態になり、この割合まで戻るまで再ダッシュできない
   exhaustThreshold: 0.35,
   markDuration: 3.0,     // エリアを出た泥棒が見え続ける秒数
@@ -102,6 +102,16 @@ const T = {
   repathInterval: 0.4,   // 逃走先を選び直す間隔（秒）
   avoidRepath: 0.8,      // 回避先を見直す間隔（秒）
   wanderRepath: 1.5,     // 徘徊先を見直す間隔（秒）
+
+  // 味方AI警官：発見と足止めはできるが、収監できるのはプレイヤーだけ。
+  // 位置は常に見えるので、その警戒状態がそのまま索敵の手がかりになる。
+  allySpeed: 126,        // 平時の巡回速度
+  allyChase: 158,        // 警戒時の追跡速度
+  allyNotice: 6,         // 泥棒を発見する距離（マス／通路沿い）
+  allyAlertMemory: 3.0,  // 見失ってから警戒を解くまでの秒数
+  allyRepath: 0.4,       // 警戒時に進路を引き直す間隔（秒）
+  pinDuration: 4.0,      // 足止めされる秒数（この間にプレイヤーが駆けつける）
+  pinImmunity: 5.0,      // 足止め直後、再び足止めされない秒数
 };
 
 // ---------------------------------------------------------------------------
@@ -145,6 +155,7 @@ const AREA_NAMES = [
 
 const JAIL = { c0: 25, r0: 17, c1: 26, r1: 19 }; // 南東エリアの隅
 const PLAYER_START = { c: 22, r: 19 }; // 牢屋のある南東から出発する
+const ALLY_START = { c: 15, r: 9 };    // 味方AI警官は中央から巡回を始める
 // 牢屋（南東）から遠い4エリアに1人ずつ散らす。固めると団子で一網打尽になる。
 const THIEF_STARTS = [{ c: 2, r: 1 }, { c: 15, r: 1 }, { c: 25, r: 1 }, { c: 5, r: 9 }];
 
@@ -200,6 +211,8 @@ function bfs(startC, startR, out) {
 }
 
 const distFromCop = new Int32Array(MW * MH);
+const distFromAlly = new Int32Array(MW * MH);
+const threatDist = new Int32Array(MW * MH);  // 警察と仲間の、近いほうまでの距離
 const scratchDist = new Int32Array(MW * MH); // 逃走先の選定に使い回す
 
 // ---------------------------------------------------------------------------
@@ -272,19 +285,31 @@ function moveEntity(e, dx, dy) {
 // ---------------------------------------------------------------------------
 // ゲーム状態
 // ---------------------------------------------------------------------------
-let cop, thieves, timeLeft, phase, effects, elapsed;
+let cop, ally, thieves, timeLeft, phase, effects, elapsed;
 
 function reset() {
   const p = centerOf(PLAYER_START.c, PLAYER_START.r);
   cop = { x: p.x, y: p.y, stamina: 1, exhausted: false, dashing: false, facing: 0 };
+  const a = centerOf(ALLY_START.c, ALLY_START.r);
+  ally = {
+    x: a.x, y: a.y,
+    state: 'patrol',         // patrol（平時） | alert（警戒）
+    target: null,
+    alertTimer: 0,
+    goal: null,
+    goalDist: new Int32Array(MW * MH),
+    repath: 0,
+  };
   thieves = THIEF_STARTS.map((s, i) => {
     const c = centerOf(s.c, s.r);
     return {
       id: i, x: c.x, y: c.y,
       stamina: 1, exhausted: false, jailed: false,
-      state: 'wander',       // wander | flee
+      state: 'wander',       // wander | avoid | flee
       fleeTimer: 0,
       mark: 0,               // エリア外でも見え続ける残り秒数
+      stun: 0,               // 仲間に足止めされている残り秒数
+      immune: 0,             // 足止め直後の無敵時間
       goal: null,            // 目標マス
       goalDist: new Int32Array(MW * MH),
       repath: 0,
@@ -425,43 +450,71 @@ function updateCop(dt) {
   }
 }
 
-// 逃走先を選ぶ：警察から遠く、自分からは近く、行き止まりでないマス。
+// 逃走先を選ぶ：追手から遠く、自分からは近く、行き止まりでないマス。
 function pickFleeGoal(t) {
   const tc = Math.floor(t.x / TILE), tr = Math.floor(t.y / TILE);
   const fromThief = bfs(tc, tr, scratchDist);
-  const copArea = areaOf(cop.x, cop.y);
+  const copArea = areaOf(cop.x, cop.y), allyArea = areaOf(ally.x, ally.y);
   let best = -Infinity, goal = null;
   for (let r = 0; r < MH; r++) for (let c = 0; c < MW; c++) {
     const i = tileIndex(c, r);
     if (isWall(c, r) || fromThief[i] < 0) continue;
-    const dCop = distFromCop[i] < 0 ? 0 : distFromCop[i];
+    const dCop = threatDist[i] < 0 ? 0 : threatDist[i];
     // 行き止まりは追い詰められるので強く避ける
     const penalty = openness[i] <= 1 ? 15 : 0;
-    // 警察のいるエリアから出ることを優先する（視界を切るのが最大の防御）
-    const escape = areaOf(c * TILE + TILE / 2, r * TILE + TILE / 2) !== copArea ? 4 : 0;
+    // 追手のいるエリアから出ることを優先する（視界を切るのが最大の防御）
+    const a = areaOf(c * TILE + TILE / 2, r * TILE + TILE / 2);
+    const escape = (a !== copArea ? 4 : 0) + (a !== allyArea ? 2 : 0);
     const score = dCop + escape - fromThief[i] * 0.25 - penalty + Math.random() * 1.5;
     if (score > best) { best = score; goal = { c, r }; }
   }
   return goal;
 }
 
-// 徘徊先：警察から十分離れていて、警察のいるエリアでもないマス。
+// 徘徊先：追手から十分離れていて、追手のいるエリアでもないマス。
 // ここを無条件のランダムにすると、泥棒が自分から警察に歩いてきて索敵が成立しない。
 function pickWanderGoal(t) {
-  const copArea = areaOf(cop.x, cop.y);
+  const copArea = areaOf(cop.x, cop.y), allyArea = areaOf(ally.x, ally.y);
   let fallback = null;
   for (let tries = 0; tries < 80; tries++) {
     const c = (Math.random() * MW) | 0, r = (Math.random() * MH) | 0;
     const i = tileIndex(c, r);
     if (isWall(c, r) || openness[i] <= 1) continue;
-    const dCop = distFromCop[i];
+    const dCop = threatDist[i];
     if (dCop >= 0 && dCop < T.noticeRange) continue;
     if (!fallback) fallback = { c, r };
     if (dCop >= 0 && dCop < T.awareRange) continue;
-    if (areaOf(c * TILE + TILE / 2, r * TILE + TILE / 2) === copArea) continue;
+    const a = areaOf(c * TILE + TILE / 2, r * TILE + TILE / 2);
+    if (a === copArea || a === allyArea) continue;
     return { c, r };
   }
   return fallback;
+}
+
+// 距離場の勾配で操舵する。マス中心を順に辿らせると角を斜めに抜けられず、
+// 直線的に追ってくる相手に一方的に詰められてしまう。泥棒と仲間で共用。
+function steerField(e, field, speed) {
+  const tc = Math.floor(e.x / TILE), tr = Math.floor(e.y / TILE);
+  const here = field[tileIndex(tc, tr)];
+  let vx = 0, vy = 0;
+  if (here >= 0) {
+    for (let i = 0; i < 4; i++) {
+      const cc = tc + DX[i], cr = tr + DY[i];
+      if (isWall(cc, cr)) continue;
+      const d = field[tileIndex(cc, cr)];
+      if (d < 0) continue;
+      const w = here - d;               // 下り方向の強さ
+      if (w > 0) { vx += DX[i] * w; vy += DY[i] * w; }
+    }
+  }
+  const g = Math.hypot(vx, vy);
+  const c0 = centerOf(tc, tr);
+  // 進行方向1マス先を狙う。通路の中心に戻す力も同時に働く。
+  const aimX = g > 0 ? c0.x + (vx / g) * TILE : c0.x;
+  const aimY = g > 0 ? c0.y + (vy / g) * TILE : c0.y;
+  const sx = aimX - e.x, sy = aimY - e.y;
+  const len = Math.hypot(sx, sy);
+  if (len > 0.5) moveEntity(e, (sx / len) * speed, (sy / len) * speed);
 }
 
 function setGoal(t, goal) {
@@ -472,8 +525,19 @@ function setGoal(t, goal) {
 function updateThief(t, dt) {
   if (t.jailed) return;
 
+  if (t.immune > 0) t.immune -= dt;
+
+  // 仲間に足止めされている間は動けない。プレイヤーが駆けつける猶予になる。
+  if (t.stun > 0) {
+    t.stun -= dt;
+    if (t.stun <= 0) t.immune = T.pinImmunity;
+    if (Math.hypot(t.x - cop.x, t.y - cop.y) < T.catchDist) jail(t);
+    return;
+  }
+
   const tc = Math.floor(t.x / TILE), tr = Math.floor(t.y / TILE);
-  const dCop = distFromCop[tileIndex(tc, tr)];
+  // 脅威は警察と仲間のうち近いほう。仲間を無視すると自分から突っ込んでいく。
+  const dCop = threatDist[tileIndex(tc, tr)];
   const noticed = dCop >= 0 && dCop <= T.noticeRange;
   const sensed = dCop >= 0 && dCop <= T.awareRange;
 
@@ -509,33 +573,72 @@ function updateThief(t, dt) {
   }
   const speed = (wantDash ? T.thiefDash : T.thiefSpeed) * dt;
 
-  // 目標へ向かう：距離場の勾配で操舵する。
-  // マス中心を順に辿らせると角を斜めに抜けられず、警察に一方的に詰められてしまう。
-  if (t.goal) {
-    const here = t.goalDist[tileIndex(tc, tr)];
-    let vx = 0, vy = 0;
-    if (here >= 0) {
-      for (let i = 0; i < 4; i++) {
-        const cc = tc + DX[i], cr = tr + DY[i];
-        if (isWall(cc, cr)) continue;
-        const d = t.goalDist[tileIndex(cc, cr)];
-        if (d < 0) continue;
-        const w = here - d;               // 下り方向の強さ
-        if (w > 0) { vx += DX[i] * w; vy += DY[i] * w; }
-      }
-    }
-    const g = Math.hypot(vx, vy);
-    const c0 = centerOf(tc, tr);
-    // 進行方向1マス先を狙う。通路の中心に戻す力も同時に働く。
-    const aimX = g > 0 ? c0.x + (vx / g) * TILE : c0.x;
-    const aimY = g > 0 ? c0.y + (vy / g) * TILE : c0.y;
-    const sx = aimX - t.x, sy = aimY - t.y;
-    const len = Math.hypot(sx, sy);
-    if (len > 0.5) moveEntity(t, (sx / len) * speed, (sy / len) * speed);
-  }
+  if (t.goal) steerField(t, t.goalDist, speed);
 
   // 収監判定
   if (Math.hypot(t.x - cop.x, t.y - cop.y) < T.catchDist) jail(t);
+}
+
+// 味方AI警官。巡回して泥棒を探し、見つけたら追って足止めする。収監はできない。
+// プレイヤーからは位置と警戒状態が常に見えるので、これ自体が索敵の情報源になる。
+function updateAlly(dt) {
+  const ac = Math.floor(ally.x / TILE), ar = Math.floor(ally.y / TILE);
+
+  // 発見：巡回中でも追跡中でも、近くの捕まっていない泥棒を見つける
+  let seen = null, bd = Infinity;
+  for (const t of thieves) {
+    if (t.jailed) continue;
+    const d = distFromAlly[tileIndex(Math.floor(t.x / TILE), Math.floor(t.y / TILE))];
+    if (d >= 0 && d <= T.allyNotice && d < bd) { bd = d; seen = t; }
+  }
+
+  const prev = ally.state;
+  if (seen) {
+    ally.state = 'alert';
+    ally.target = seen;
+    ally.alertTimer = T.allyAlertMemory;
+  } else if (ally.state === 'alert') {
+    ally.alertTimer -= dt;
+    if (ally.alertTimer <= 0 || !ally.target || ally.target.jailed) {
+      ally.state = 'patrol';
+      ally.target = null;
+    }
+  }
+  if (ally.state !== prev) { ally.goal = null; ally.repath = 0; }
+
+  ally.repath -= dt;
+  if (ally.state === 'alert' && ally.target) {
+    // 追跡中は目標の現在地へ引き直し続ける
+    if (ally.repath <= 0) {
+      const t = ally.target;
+      bfs(Math.floor(t.x / TILE), Math.floor(t.y / TILE), ally.goalDist);
+      ally.repath = T.allyRepath;
+    }
+    steerField(ally, ally.goalDist, T.allyChase * dt);
+
+    // 接触：足止めする。収監はプレイヤーだけの仕事。
+    const t = ally.target;
+    if (!t.jailed && t.stun <= 0 && t.immune <= 0 &&
+        Math.hypot(t.x - ally.x, t.y - ally.y) < T.catchDist) {
+      t.stun = T.pinDuration;
+      effects.push({ x: t.x, y: t.y, life: 0.5, max: 0.5 });
+    }
+  } else {
+    // 巡回：適当に離れたマスを目指して歩き回る
+    const reached = ally.goal && ac === ally.goal.c && ar === ally.goal.r;
+    if (!ally.goal || reached || ally.repath <= 0) {
+      for (let tries = 0; tries < 60; tries++) {
+        const c = (Math.random() * MW) | 0, r = (Math.random() * MH) | 0;
+        if (isWall(c, r) || openness[tileIndex(c, r)] <= 1) continue;
+        if (Math.hypot(c - ac, r - ar) < 8) continue;
+        ally.goal = { c, r };
+        bfs(c, r, ally.goalDist);
+        break;
+      }
+      ally.repath = 3.0;
+    }
+    if (ally.goal) steerField(ally, ally.goalDist, T.allySpeed * dt);
+  }
 }
 
 function jail(t) {
@@ -556,6 +659,13 @@ function update(dt) {
 
   updateCop(dt);
   bfs(Math.floor(cop.x / TILE), Math.floor(cop.y / TILE), distFromCop);
+  bfs(Math.floor(ally.x / TILE), Math.floor(ally.y / TILE), distFromAlly);
+  for (let i = 0; i < threatDist.length; i++) {
+    const a = distFromCop[i], b = distFromAlly[i];
+    threatDist[i] = a < 0 ? b : b < 0 ? a : Math.min(a, b);
+  }
+
+  updateAlly(dt);
 
   const copArea = areaOf(cop.x, cop.y);
   for (const t of thieves) {
@@ -631,6 +741,48 @@ function drawFog(copArea) {
   ctx.strokeStyle = 'rgba(140,190,255,.35)';
   ctx.lineWidth = 2;
   ctx.strokeRect(cx + 1, cy + 1, aw - 2, ah - 2);
+
+  // 仲間が警戒中のエリアを琥珀色に光らせる。
+  // 「あそこに泥棒がいる」がマップを一目見るだけで伝わるようにする。
+  if (ally.state === 'alert') {
+    const a = areaOf(ally.x, ally.y);
+    const ax = (a % 3) * aw, ay = Math.floor(a / 3) * ah;
+    const pulse = 0.5 + 0.5 * Math.sin(elapsed * 6);
+    ctx.fillStyle = `rgba(255,180,60,${0.05 + 0.05 * pulse})`;
+    ctx.fillRect(ax, ay, aw, ah);
+    ctx.strokeStyle = `rgba(255,190,80,${0.45 + 0.35 * pulse})`;
+    ctx.lineWidth = 3;
+    ctx.strokeRect(ax + 2, ay + 2, aw - 4, ah - 4);
+  }
+}
+
+// 味方AI警官。フォグの上に描くので、どのエリアにいても常に見える。
+function drawAlly() {
+  const alert = ally.state === 'alert';
+  const pulse = 0.5 + 0.5 * Math.sin(elapsed * 6);
+
+  if (alert) {
+    // 警戒中は外側に広がる輪を出す
+    ctx.strokeStyle = `rgba(255,180,60,${0.5 * (1 - pulse)})`;
+    ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(ally.x, ally.y, 10 + pulse * 12, 0, Math.PI * 2); ctx.stroke();
+  }
+  ctx.fillStyle = alert ? '#ffb43c' : '#5a86c4';
+  ctx.beginPath(); ctx.arc(ally.x, ally.y, 8, 0, Math.PI * 2); ctx.fill();
+  ctx.strokeStyle = alert ? '#fff0cf' : '#9fb8dd';
+  ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.arc(ally.x, ally.y, 8, 0, Math.PI * 2); ctx.stroke();
+
+  // 平時か警戒かを文字でも出す（色だけだと小さくて読み取りにくい）
+  ctx.textAlign = 'center';
+  ctx.font = 'bold 11px system-ui';
+  if (alert) {
+    ctx.fillStyle = '#ffd35c';
+    ctx.fillText('警戒', ally.x, ally.y - 14);
+  } else {
+    ctx.fillStyle = 'rgba(159,184,221,.75)';
+    ctx.fillText('仲間', ally.x, ally.y - 14);
+  }
 }
 
 function drawThief(t, copArea) {
@@ -639,7 +791,21 @@ function drawThief(t, copArea) {
     ctx.beginPath(); ctx.arc(t.x, t.y, 7, 0, Math.PI * 2); ctx.fill();
     return;
   }
+  // 足止め中は、フォグ越しでも見える。駆けつければ収監できると分かるように。
   const inArea = areaOf(t.x, t.y) === copArea;
+  if (t.stun > 0) {
+    const pulse = 0.5 + 0.5 * Math.sin(elapsed * 10);
+    ctx.strokeStyle = `rgba(255,210,90,${0.55 + 0.35 * pulse})`;
+    ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.arc(t.x, t.y, 13, 0, Math.PI * 2); ctx.stroke();
+    ctx.fillStyle = '#ff7a45';
+    ctx.beginPath(); ctx.arc(t.x, t.y, 8, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = '#ffd35c';
+    ctx.font = 'bold 11px system-ui';
+    ctx.textAlign = 'center';
+    ctx.fillText('確保', t.x, t.y - 17);
+    return;
+  }
   if (inArea) {
     ctx.fillStyle = '#ff7a45';
     ctx.beginPath(); ctx.arc(t.x, t.y, 8, 0, Math.PI * 2); ctx.fill();
@@ -738,10 +904,20 @@ function drawHUD(copArea) {
   ctx.font = 'bold 24px system-ui';
   ctx.fillText(String(visible), 560, 37);
 
+  // 仲間の状況。位置は常に見えるので、その状態がそのまま索敵の手がかりになる。
+  const allyArea = areaOf(ally.x, ally.y);
+  const alert = ally.state === 'alert';
+  ctx.fillStyle = '#8b97b0';
+  ctx.font = '11px system-ui';
+  ctx.fillText('仲間', 630, 18);
+  ctx.fillStyle = alert ? '#ffb43c' : '#7f8aa3';
+  ctx.font = 'bold 17px system-ui';
+  ctx.fillText(`${AREA_NAMES[Math.floor(allyArea / 3)][allyArea % 3]}で${alert ? '警戒中' : '平時'}`, 630, 38);
+
   ctx.fillStyle = '#4d566d';
   ctx.font = '11px system-ui';
   ctx.textAlign = 'right';
-  ctx.fillText('ケイドロ プロトタイプ v0.1　—　第1段階：移動・エリア可視・追跡・収監', FIELD_W - 20, 28);
+  ctx.fillText('ケイドロ プロトタイプ v0.2', FIELD_W - 20, 28);
 }
 
 function drawResult() {
@@ -782,6 +958,7 @@ function render() {
   drawJail();
   drawFog(copArea);
   for (const t of thieves) drawThief(t, copArea);
+  drawAlly();
   drawCop();
   drawEffects();
   drawResult();

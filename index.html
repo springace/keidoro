@@ -7,7 +7,7 @@
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-<title>ケイドロ プロトタイプ v0.3</title>
+<title>ケイドロ プロトタイプ v0.4</title>
 <style>
   html, body {
     margin: 0; padding: 0; height: 100%; overflow: hidden;
@@ -123,6 +123,17 @@ const T = {
   allyRepath: 0.4,       // 警戒時に進路を引き直す間隔（秒）
   pinDuration: 4.0,      // 足止めされる秒数（この間にプレイヤーが駆けつける）
   pinImmunity: 5.0,      // 足止め直後、再び足止めされない秒数
+
+  // 迷路のギミック
+  doorOpen: 5.0,         // 扉が開いている秒数（警告時間を含む）
+  doorClosed: 3.2,       // 閉じている秒数
+  doorWarn: 1.0,         // 閉まる前に点滅で予告する秒数
+  spikeSafe: 2.8,        // 針が引っ込んでいる秒数
+  spikeWarn: 0.7,        // せり上がる予告の秒数
+  spikeOut: 1.5,         // 針が出ている秒数
+  spikeSlowTime: 2.5,    // 刺さったあと足が鈍る秒数
+  spikeSlowFactor: 0.5,  // そのときの速度倍率
+  warpCooldown: 2.5,     // ワープ直後、再びワープできない秒数
 };
 
 // ---------------------------------------------------------------------------
@@ -195,6 +206,93 @@ for (let r = 0; r < MH; r++) for (let c = 0; c < MW; c++) {
 }
 
 // ---------------------------------------------------------------------------
+// 迷路のギミック（= | 扉 / S 針の床 / W ワープ）
+//
+// 扉の位置は「4枚すべてが同時に閉じてもマップが分断されない」ことを確認して
+// 選んである。分断されると迂回路が消え、AIも経路を失ってゲームが壊れるため。
+// ---------------------------------------------------------------------------
+const GIMMICK = [
+  '..............................',
+  '........SS....................',
+  '..............................',
+  '..............................',
+  '..............................',
+  '..=...........................',
+  '..............................',
+  '.......................SS.....',
+  '............................W.',
+  '..............................',
+  '..............................',
+  '..........=...................',
+  '..............................',
+  '..............................',
+  '..........W.................|.',
+  '.............SS...............',
+  '..............................',
+  '..............................',
+  '..............................',
+  '.W.=..........................',
+  '..............................',
+];
+
+const doors = [], spikeGroups = [], warps = [];
+const spikeAt = new Int8Array(MW * MH).fill(-1);
+const warpAt = new Int8Array(MW * MH).fill(-1);
+const doorBlocked = new Uint8Array(MW * MH);
+
+for (let r = 0; r < MH; r++) for (let c = 0; c < MW; c++) {
+  const ch = GIMMICK[r][c];
+  const i = tileIndex(c, r);
+  if (ch === '=' || ch === '|') {
+    // '=' は東西に伸びる通路を塞ぐ扉（＝縦棒として描く）
+    doors.push({ c, r, i, horiz: ch === '=', phase: doors.length * 2.1, state: 'open' });
+  } else if (ch === 'W') {
+    warpAt[i] = warps.length;
+    warps.push({ c, r });
+  } else if (ch === 'S') {
+    // 隣り合う S は同じ組にして、まとめて上下させる
+    const left = c > 0 && GIMMICK[r][c - 1] === 'S' ? spikeAt[tileIndex(c - 1, r)] : -1;
+    const up = r > 0 && GIMMICK[r - 1][c] === 'S' ? spikeAt[tileIndex(c, r - 1)] : -1;
+    let g = left >= 0 ? left : up;
+    if (g < 0) {
+      g = spikeGroups.length;
+      spikeGroups.push({ tiles: [], phase: g * 1.6, state: 'safe' });
+    }
+    spikeAt[i] = g;
+    spikeGroups[g].tiles.push({ c, r });
+  }
+}
+
+function doorPhaseAt(d) {
+  const cycle = T.doorOpen + T.doorClosed;
+  const t = (elapsed + d.phase) % cycle;
+  if (t < T.doorOpen - T.doorWarn) return 'open';
+  if (t < T.doorOpen) return 'closing';   // 点滅で予告
+  return 'closed';
+}
+function spikePhaseAt(g) {
+  const cycle = T.spikeSafe + T.spikeWarn + T.spikeOut;
+  const t = (elapsed + g.phase) % cycle;
+  if (t < T.spikeSafe) return 'safe';
+  if (t < T.spikeSafe + T.spikeWarn) return 'warn';
+  return 'out';
+}
+
+function updateGimmicks(copArea) {
+  doorBlocked.fill(0);
+  for (const d of doors) {
+    const prev = d.state;
+    d.state = doorPhaseAt(d);
+    if (d.state === 'closed') {
+      doorBlocked[d.i] = 1;
+      // 自分のいるエリアの扉が閉まったときだけ音を出す
+      if (prev !== 'closed' && areaOf(d.c * TILE + 16, d.r * TILE + 16) === copArea) Snd.door();
+    }
+  }
+  for (const g of spikeGroups) g.state = spikePhaseAt(g);
+}
+
+// ---------------------------------------------------------------------------
 // 経路探索（幅優先。630マスなので毎フレーム回しても軽い）
 // ---------------------------------------------------------------------------
 const DX = [1, -1, 0, 0], DY = [0, 0, 1, -1];
@@ -211,7 +309,8 @@ function bfs(startC, startR, out) {
     const cc = cur % MW, cr = (cur / MW) | 0, d = out[cur] + 1;
     for (let i = 0; i < 4; i++) {
       const nc = cc + DX[i], nr = cr + DY[i];
-      if (isWall(nc, nr)) continue;
+      // 閉じている扉は壁として扱う。分断は起きない配置なので必ず迂回路がある。
+      if (isWall(nc, nr) || doorBlocked[tileIndex(nc, nr)]) continue;
       const ni = tileIndex(nc, nr);
       if (out[ni] !== -1) continue;
       out[ni] = d;
@@ -233,10 +332,27 @@ const RADIUS = 9;          // 描画サイズと揃える。これより太い�
 const CORNER_ASSIST = 13;  // 角を曲がるとき、通路の口へ自動で寄せてやる最大幅（px）
 const CORNER_SLIDE = 2.2;  // 寄せる速さの倍率。小さいと曲がりだしが重く、大きいと滑る
 
+// いま自分が重なっている閉扉。ここは通り抜けを許さないと、扉が閉じた瞬間に
+// 中にいた者が永久に動けなくなる。出るのは自由、入るのは不可、という扱い。
+const standingIn = [];
+function updateStandingIn(e) {
+  standingIn.length = 0;
+  for (const d of doors) {
+    if (!doorBlocked[d.i]) continue;
+    const x0 = d.c * TILE, y0 = d.r * TILE;
+    if (e.x + RADIUS > x0 && e.x - RADIUS < x0 + TILE &&
+        e.y + RADIUS > y0 && e.y - RADIUS < y0 + TILE) standingIn.push(d.i);
+  }
+}
+
 function blocked(x, y) {
   const c0 = Math.floor((x - RADIUS) / TILE), c1 = Math.floor((x + RADIUS) / TILE);
   const r0 = Math.floor((y - RADIUS) / TILE), r1 = Math.floor((y + RADIUS) / TILE);
-  for (let r = r0; r <= r1; r++) for (let c = c0; c <= c1; c++) if (isWall(c, r)) return true;
+  for (let r = r0; r <= r1; r++) for (let c = c0; c <= c1; c++) {
+    if (isWall(c, r)) return true;
+    const i = tileIndex(c, r);
+    if (doorBlocked[i] && !standingIn.includes(i)) return true;
+  }
   return false;
 }
 
@@ -282,6 +398,7 @@ function centerAssist(e, dx, dy) {
 }
 
 function moveEntity(e, dx, dy) {
+  updateStandingIn(e);
   if (dx) {
     if (!blocked(e.x + dx, e.y)) e.x += dx;
     else slideAssist(e, dx, 0, 'x');
@@ -302,7 +419,8 @@ const cue = { visible: 0, allyAlert: false, exhausted: false, sec: 0 };
 
 function reset() {
   const p = centerOf(PLAYER_START.c, PLAYER_START.r);
-  cop = { x: p.x, y: p.y, stamina: 1, exhausted: false, dashing: false, facing: 0 };
+  cop = { x: p.x, y: p.y, stamina: 1, exhausted: false, dashing: false, facing: 0,
+          warpCd: 0, slow: 0, stun: 0 };
   const a = centerOf(ALLY_START.c, ALLY_START.r);
   ally = {
     x: a.x, y: a.y,
@@ -312,6 +430,7 @@ function reset() {
     goal: null,
     goalDist: new Int32Array(MW * MH),
     repath: 0,
+    warpCd: 0, slow: 0, stun: 0,
   };
   thieves = THIEF_STARTS.map((s, i) => {
     const c = centerOf(s.c, s.r);
@@ -322,6 +441,7 @@ function reset() {
       fleeTimer: 0,
       mark: 0,               // エリア外でも見え続ける残り秒数
       stun: 0,               // 仲間に足止めされている残り秒数
+      warpCd: 0, slow: 0,    // ワープの再使用待ちと、針で鈍っている残り秒数
       immune: 0,             // 足止め直後の無敵時間
       goal: null,            // 目標マス
       goalDist: new Int32Array(MW * MH),
@@ -486,6 +606,25 @@ const Snd = (() => {
     gasp() {   // 息切れ
       if (!ctx || !enabled) return;
       noise(ctx.currentTime, 0.28, 0.13, 500, sfxBus);
+    },
+    warp() {   // ワープした
+      if (!ctx || !enabled) return;
+      const t = ctx.currentTime;
+      tone(t, 300, 0.22, 0.20, 'sine', sfxBus, 1500);
+      tone(t + 0.05, 900, 0.18, 0.12, 'triangle', sfxBus, 2200);
+      noise(t, 0.16, 0.10, 1800, sfxBus);
+    },
+    spike() {  // 針が刺さった
+      if (!ctx || !enabled) return;
+      const t = ctx.currentTime;
+      noise(t, 0.09, 0.24, 4000, sfxBus);
+      tone(t, 520, 0.20, 0.22, 'sawtooth', sfxBus, 130);
+    },
+    door() {   // 近くの扉が閉まった
+      if (!ctx || !enabled) return;
+      const t = ctx.currentTime;
+      noise(t, 0.11, 0.20, 700, sfxBus);
+      tone(t, 190, 0.16, 0.20, 'square', sfxBus, 95);
     },
     warn() {   // 残り60秒・30秒
       if (!ctx || !enabled) return;
@@ -675,7 +814,7 @@ function updateCop(dt) {
 
   if (moving) {
     const len = Math.hypot(dx, dy);
-    const sp = (wantDash ? T.copDash : T.copSpeed) * dt;
+    const sp = (wantDash ? T.copDash : T.copSpeed) * (cop.slow > 0 ? T.spikeSlowFactor : 1) * dt;
     moveEntity(cop, (dx / len) * sp, (dy / len) * sp);
     cop.facing = Math.atan2(dy, dx);
   }
@@ -802,7 +941,7 @@ function updateThief(t, dt) {
     t.stamina = Math.min(1, t.stamina + dt / T.thiefRecover);
     if (t.stamina >= T.exhaustThreshold) t.exhausted = false;
   }
-  const speed = (wantDash ? T.thiefDash : T.thiefSpeed) * dt;
+  const speed = (wantDash ? T.thiefDash : T.thiefSpeed) * (t.slow > 0 ? T.spikeSlowFactor : 1) * dt;
 
   if (t.goal) steerField(t, t.goalDist, speed);
 
@@ -845,7 +984,7 @@ function updateAlly(dt) {
       bfs(Math.floor(t.x / TILE), Math.floor(t.y / TILE), ally.goalDist);
       ally.repath = T.allyRepath;
     }
-    steerField(ally, ally.goalDist, T.allyChase * dt);
+    steerField(ally, ally.goalDist, T.allyChase * (ally.slow > 0 ? T.spikeSlowFactor : 1) * dt);
 
     // 接触：足止めする。収監はプレイヤーだけの仕事。
     const t = ally.target;
@@ -869,7 +1008,35 @@ function updateAlly(dt) {
       }
       ally.repath = 3.0;
     }
-    if (ally.goal) steerField(ally, ally.goalDist, T.allySpeed * dt);
+    if (ally.goal) steerField(ally, ally.goalDist, T.allySpeed * (ally.slow > 0 ? T.spikeSlowFactor : 1) * dt);
+  }
+}
+
+// 床のギミック。ワープと針は警察・仲間・泥棒のすべてに等しく効く。
+function applyTileEffects(e, dt) {
+  if (e.warpCd > 0) e.warpCd -= dt;
+  if (e.slow > 0) e.slow -= dt;
+  if (e.stun > 0) return;   // 足止め中は動けないのでワープもしない
+
+  const i = tileIndex(Math.floor(e.x / TILE), Math.floor(e.y / TILE));
+
+  const w = warpAt[i];
+  if (w >= 0 && e.warpCd <= 0 && warps.length > 1) {
+    let n = w;
+    while (n === w) n = (Math.random() * warps.length) | 0;
+    const to = centerOf(warps[n].c, warps[n].r);
+    effects.push({ x: e.x, y: e.y, life: 0.45, max: 0.45, kind: 'warp' });
+    e.x = to.x; e.y = to.y;
+    e.warpCd = T.warpCooldown;
+    effects.push({ x: to.x, y: to.y, life: 0.45, max: 0.45, kind: 'warp' });
+    if (e === cop) Snd.warp();
+    return;
+  }
+
+  const g = spikeAt[i];
+  if (g >= 0 && spikeGroups[g].state === 'out') {
+    if (e.slow <= 0 && e === cop) Snd.spike();
+    e.slow = T.spikeSlowTime;
   }
 }
 
@@ -891,7 +1058,10 @@ function update(dt) {
   elapsed += dt;
   timeLeft -= dt;
 
+  updateGimmicks(areaOf(cop.x, cop.y));
+
   updateCop(dt);
+  applyTileEffects(cop, dt);
   bfs(Math.floor(cop.x / TILE), Math.floor(cop.y / TILE), distFromCop);
   bfs(Math.floor(ally.x / TILE), Math.floor(ally.y / TILE), distFromAlly);
   for (let i = 0; i < threatDist.length; i++) {
@@ -900,10 +1070,12 @@ function update(dt) {
   }
 
   updateAlly(dt);
+  applyTileEffects(ally, dt);
 
   const copArea = areaOf(cop.x, cop.y);
   for (const t of thieves) {
     updateThief(t, dt);
+    if (!t.jailed) applyTileEffects(t, dt);
     if (!t.jailed) {
       // 同エリアにいれば見える。出た後も markDuration 秒は輪郭が残る。
       if (areaOf(t.x, t.y) === copArea) t.mark = T.markDuration;
@@ -975,6 +1147,61 @@ function drawJail() {
   ctx.font = '10px system-ui';
   ctx.textAlign = 'center';
   ctx.fillText('牢屋', x + w / 2, y - 5);
+}
+
+// ギミックは地形の一部なのでフォグの下に描く（遠くのものは暗く見える）
+function drawGimmicks() {
+  for (const w of warps) {
+    const p = centerOf(w.c, w.r);
+    ctx.fillStyle = 'rgba(150,110,255,.18)';
+    ctx.beginPath(); ctx.arc(p.x, p.y, 12, 0, Math.PI * 2); ctx.fill();
+    ctx.strokeStyle = 'rgba(178,146,255,.85)';
+    ctx.lineWidth = 2;
+    for (let i = 0; i < 3; i++) {
+      const a0 = elapsed * 2.4 + i * Math.PI * 2 / 3;
+      ctx.beginPath(); ctx.arc(p.x, p.y, 11 - i * 3.2, a0, a0 + 1.5); ctx.stroke();
+    }
+  }
+
+  for (const g of spikeGroups) {
+    for (const t of g.tiles) {
+      const x = t.c * TILE, y = t.r * TILE;
+      if (g.state === 'out') {
+        ctx.fillStyle = 'rgba(255,80,60,.16)';
+        ctx.fillRect(x, y, TILE, TILE);
+        ctx.fillStyle = '#dbe2ef';
+        for (let i = 0; i < 4; i++) {
+          const px = x + 2 + i * 8;
+          ctx.beginPath();
+          ctx.moveTo(px, y + TILE - 3);
+          ctx.lineTo(px + 4, y + 6);
+          ctx.lineTo(px + 8, y + TILE - 3);
+          ctx.closePath(); ctx.fill();
+        }
+      } else {
+        const warn = g.state === 'warn';
+        const a = warn ? 0.35 + 0.5 * Math.abs(Math.sin(elapsed * 16)) : 0.3;
+        ctx.fillStyle = warn ? `rgba(255,170,70,${a})` : `rgba(150,168,200,${a})`;
+        for (let i = 0; i < 4; i++) ctx.fillRect(x + 3 + i * 8, y + TILE - 8, 5, 5);
+      }
+    }
+  }
+
+  for (const d of doors) {
+    const x = d.c * TILE, y = d.r * TILE;
+    // 戸袋。閉じていなくても扉の在処が分かるようにしておく
+    ctx.fillStyle = '#58627e';
+    if (d.horiz) { ctx.fillRect(x + 11, y, 10, 5); ctx.fillRect(x + 11, y + TILE - 5, 10, 5); }
+    else { ctx.fillRect(x, y + 11, 5, 10); ctx.fillRect(x + TILE - 5, y + 11, 5, 10); }
+
+    if (d.state === 'open') continue;
+    const closing = d.state === 'closing';
+    ctx.fillStyle = closing
+      ? `rgba(255,175,80,${0.35 + 0.5 * Math.abs(Math.sin(elapsed * 13))})`
+      : 'rgba(224,116,88,.9)';
+    if (d.horiz) ctx.fillRect(x + 12, y + 3, 8, TILE - 6);
+    else ctx.fillRect(x + 3, y + 12, TILE - 6, 8);
+  }
 }
 
 function drawFog(copArea) {
@@ -1063,6 +1290,7 @@ function drawThief(t, copArea) {
     return;
   }
   if (inArea) {
+    drawSlow(t, 8);
     ctx.fillStyle = '#ff7a45';
     ctx.beginPath(); ctx.arc(t.x, t.y, 8, 0, Math.PI * 2); ctx.fill();
     ctx.strokeStyle = 'rgba(255,190,150,.9)'; ctx.lineWidth = 1.5;
@@ -1084,6 +1312,7 @@ function drawThief(t, copArea) {
 }
 
 function drawCop() {
+  drawSlow(cop, 9);
   ctx.fillStyle = '#4ea3ff';
   ctx.beginPath(); ctx.arc(cop.x, cop.y, 9, 0, Math.PI * 2); ctx.fill();
   ctx.strokeStyle = '#cfe6ff'; ctx.lineWidth = 2;
@@ -1099,10 +1328,21 @@ function drawCop() {
 function drawEffects() {
   for (const e of effects) {
     const p = 1 - e.life / e.max;
-    ctx.strokeStyle = `rgba(255,220,120,${1 - p})`;
+    ctx.strokeStyle = e.kind === 'warp'
+      ? `rgba(178,146,255,${1 - p})`
+      : `rgba(255,220,120,${1 - p})`;
     ctx.lineWidth = 3;
     ctx.beginPath(); ctx.arc(e.x, e.y, 10 + p * 26, 0, Math.PI * 2); ctx.stroke();
   }
+}
+
+// 針で足が鈍っている間の表示。誰に効いているかが一目で分かるようにする。
+function drawSlow(e, radius) {
+  if (e.slow <= 0) return;
+  const a = 0.35 + 0.4 * Math.abs(Math.sin(elapsed * 12));
+  ctx.strokeStyle = `rgba(255,90,70,${a})`;
+  ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.arc(e.x, e.y, radius + 5, 0, Math.PI * 2); ctx.stroke();
 }
 
 function drawHUD(copArea) {
@@ -1173,7 +1413,7 @@ function drawHUD(copArea) {
   ctx.fillStyle = '#4d566d';
   ctx.font = '11px system-ui';
   ctx.textAlign = 'right';
-  ctx.fillText('ケイドロ プロトタイプ v0.3', FIELD_W - 20, 28);
+  ctx.fillText('ケイドロ プロトタイプ v0.4', FIELD_W - 20, 28);
 }
 
 function drawResult() {
@@ -1212,6 +1452,7 @@ function render() {
   ctx.translate(0, HUD_H);
   drawMap();
   drawJail();
+  drawGimmicks();
   drawFog(copArea);
   for (const t of thieves) drawThief(t, copArea);
   drawAlly();

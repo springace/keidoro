@@ -7,7 +7,7 @@
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-<title>ケイドロ プロトタイプ v0.2</title>
+<title>ケイドロ プロトタイプ v0.3</title>
 <style>
   html, body {
     margin: 0; padding: 0; height: 100%; overflow: hidden;
@@ -32,7 +32,15 @@
     image-rendering: pixelated;
     border-radius: 6px; box-shadow: 0 8px 40px rgba(0,0,0,.6);
   }
+  .bar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; justify-content: center; }
   .note { font-size: 12px; color: #66718a; letter-spacing: .04em; text-align: center; padding: 0 8px; }
+  #sound {
+    font-family: inherit; font-size: 12px; letter-spacing: .04em; cursor: pointer;
+    color: #9fd0ff; background: rgba(30,45,75,.6);
+    border: 1px solid rgba(150,180,255,.35); border-radius: 6px; padding: 5px 12px;
+    -webkit-tap-highlight-color: transparent;
+  }
+  #sound.off { color: #5a6479; background: rgba(24,30,44,.6); border-color: rgba(120,140,190,.18); }
 
   /* --- タッチ操作。指が乗る端末でだけ出す --- */
   #touch { position: absolute; inset: 0; display: none; }
@@ -71,7 +79,10 @@
     <div id="dash">走る</div>
   </div>
 </div>
-<div class="note">WASD / 矢印キー：移動　　Shift：ダッシュ　　R：リスタート</div>
+<div class="bar">
+  <button id="sound" type="button">♪ 音 ON</button>
+  <span class="note">WASD / 矢印キー：移動　　Shift：ダッシュ　　R：リスタート　　M：音</span>
+</div>
 
 <script>
 'use strict';
@@ -286,6 +297,8 @@ function moveEntity(e, dx, dy) {
 // ゲーム状態
 // ---------------------------------------------------------------------------
 let cop, ally, thieves, timeLeft, phase, effects, elapsed;
+// 効果音を「変化した瞬間」だけ鳴らすための直前の状態
+const cue = { visible: 0, allyAlert: false, exhausted: false, sec: 0 };
 
 function reset() {
   const p = centerOf(PLAYER_START.c, PLAYER_START.r);
@@ -319,15 +332,233 @@ function reset() {
   elapsed = 0;
   phase = 'play';            // play | win | lose
   effects = [];
+  cue.visible = 0; cue.allyAlert = false; cue.exhausted = false; cue.sec = T.timeLimit;
+  Snd.music(true);
 }
+
+// ---------------------------------------------------------------------------
+// サウンド（外部ファイルなし。Web Audio ですべて合成する）
+//
+// 曲は状況に追従させる。何も見えていないときは静かな脈打ちだけ、泥棒を視認
+// すると打ち込みと不協和音が乗り、残り時間が減るほどテンポが上がる。
+// ---------------------------------------------------------------------------
+const Snd = (() => {
+  let ctx = null, master, musicBus, sfxBus, noiseBuf;
+  let enabled = true, timer = null, nextTime = 0, step = 0;
+  let intensity = 0, pressure = 0;
+
+  // ニ短調。増4度（D-Ab）を混ぜて落ち着かない響きにする。
+  const N = { D2: 73.42, E2: 82.41, F2: 87.31, G2: 98.00, Ab2: 103.83, Bb2: 116.54,
+              D4: 293.66, Eb4: 311.13, F4: 349.23, A4: 440.00, Ab4: 415.30, D5: 587.33 };
+  const BASS = [N.D2, 0, N.D2, 0, N.D2, 0, N.F2, 0, N.D2, 0, N.D2, 0, N.E2, 0, N.Bb2, 0];
+
+  function ensure() {
+    if (ctx) return true;
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return false;
+    ctx = new AC();
+    master = ctx.createGain(); master.gain.value = 0.85; master.connect(ctx.destination);
+    musicBus = ctx.createGain(); musicBus.gain.value = 0.45; musicBus.connect(master);
+    sfxBus = ctx.createGain(); sfxBus.gain.value = 0.9; sfxBus.connect(master);
+    noiseBuf = ctx.createBuffer(1, (ctx.sampleRate * 0.4) | 0, ctx.sampleRate);
+    const d = noiseBuf.getChannelData(0);
+    for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+    return true;
+  }
+
+  // --- 音源 -----------------------------------------------------------------
+  function tone(t, freq, dur, vol, type, bus, sweepTo) {
+    const o = ctx.createOscillator(); o.type = type || 'square';
+    o.frequency.setValueAtTime(freq, t);
+    if (sweepTo) o.frequency.exponentialRampToValueAtTime(sweepTo, t + dur);
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(vol, t + 0.008);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    o.connect(g).connect(bus);
+    o.start(t); o.stop(t + dur + 0.02);
+  }
+  function noise(t, dur, vol, hp, bus) {
+    const s = ctx.createBufferSource(); s.buffer = noiseBuf;
+    const f = ctx.createBiquadFilter(); f.type = 'highpass'; f.frequency.value = hp;
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(vol, t);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    s.connect(f).connect(g).connect(bus);
+    s.start(t); s.stop(t + dur + 0.02);
+  }
+  function kick(t, vol) {
+    const o = ctx.createOscillator(); o.type = 'sine';
+    o.frequency.setValueAtTime(155, t);
+    o.frequency.exponentialRampToValueAtTime(44, t + 0.11);
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(vol, t);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + 0.19);
+    o.connect(g).connect(musicBus);
+    o.start(t); o.stop(t + 0.21);
+  }
+  function bassNote(t, freq, dur, vol) {
+    const o = ctx.createOscillator(); o.type = 'sawtooth'; o.frequency.value = freq;
+    const f = ctx.createBiquadFilter(); f.type = 'lowpass';
+    f.frequency.setValueAtTime(freq * 8, t);
+    f.frequency.exponentialRampToValueAtTime(freq * 2.2, t + dur);
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(vol, t + 0.01);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    o.connect(f).connect(g).connect(musicBus);
+    o.start(t); o.stop(t + dur + 0.02);
+  }
+
+  // --- 1拍ぶんの譜面 ---------------------------------------------------------
+  function playStep(s, t, stepDur) {
+    const hot = intensity >= 2, mid = intensity >= 1;
+
+    // 低音の脈。これが常に鳴っていることで「止まっていない」感じを出す
+    const b = BASS[s];
+    if (b) bassNote(t, b, stepDur * 1.7, hot ? 0.30 : mid ? 0.24 : 0.17);
+
+    // キックは 0/6/10 の食い気味な位置に置いて落ち着かなくする
+    if (s === 0 || s === 6 || s === 10) kick(t, hot ? 0.55 : mid ? 0.45 : 0.32);
+
+    if (mid && s % 2 === 1) noise(t, 0.035, hot ? 0.16 : 0.09, 7500, musicBus);
+    if (hot && s % 2 === 0) noise(t, 0.02, 0.07, 9000, musicBus);
+
+    // 視認中だけ、高音の短2度がぶつかる音形を重ねる
+    if (hot) {
+      if (s === 0) { tone(t, N.D5, 0.09, 0.10, 'square', musicBus); }
+      if (s === 4) { tone(t, N.Eb4, 0.09, 0.09, 'square', musicBus); }
+      if (s === 8) { tone(t, N.A4, 0.09, 0.10, 'square', musicBus); }
+      if (s === 12) { tone(t, N.Ab4, 0.12, 0.09, 'square', musicBus); }
+      // 増4度のパッドを小節頭に薄く
+      if (s === 0) {
+        tone(t, N.D4, stepDur * 14, 0.035, 'sawtooth', musicBus);
+        tone(t, N.Ab4, stepDur * 14, 0.030, 'sawtooth', musicBus);
+      }
+    }
+    // 終盤は裏拍に時計の刻みを入れる
+    if (pressure > 0.72 && s % 4 === 2) noise(t, 0.015, 0.10, 6000, musicBus);
+  }
+
+  function schedule() {
+    if (!ctx || !enabled) return;
+    // 残り時間が減るほど速くなる。追跡中はさらに一段上がる。
+    const bpm = 126 + 34 * pressure + (intensity >= 2 ? 14 : intensity >= 1 ? 6 : 0);
+    const stepDur = 60 / bpm / 4;
+    // タブが裏に回るとタイマーが間引かれて大きく遅れる。取り戻そうとせず貼り直す。
+    if (nextTime < ctx.currentTime) nextTime = ctx.currentTime + 0.02;
+    while (nextTime < ctx.currentTime + 0.13) {
+      playStep(step, nextTime, stepDur);
+      nextTime += stepDur;
+      step = (step + 1) % 16;
+    }
+  }
+
+  // --- 効果音 ---------------------------------------------------------------
+  const sfx = {
+    spot() {   // 泥棒を視認した瞬間
+      if (!ctx || !enabled) return;
+      const t = ctx.currentTime;
+      tone(t, 1180, 0.07, 0.22, 'square', sfxBus);
+      tone(t + 0.07, 880, 0.10, 0.20, 'square', sfxBus);
+    },
+    capture() { // 収監
+      if (!ctx || !enabled) return;
+      const t = ctx.currentTime;
+      noise(t, 0.10, 0.30, 900, sfxBus);
+      tone(t, 330, 0.10, 0.26, 'triangle', sfxBus);
+      tone(t + 0.09, 494, 0.11, 0.26, 'triangle', sfxBus);
+      tone(t + 0.19, 659, 0.20, 0.24, 'triangle', sfxBus);
+    },
+    allyAlert() { // 仲間が警戒に入った（無線が入った合図）
+      if (!ctx || !enabled) return;
+      const t = ctx.currentTime;
+      noise(t, 0.05, 0.10, 3000, sfxBus);
+      tone(t + 0.03, 1560, 0.05, 0.16, 'square', sfxBus);
+      tone(t + 0.12, 1560, 0.05, 0.16, 'square', sfxBus);
+    },
+    pin() {    // 仲間が泥棒を足止めした
+      if (!ctx || !enabled) return;
+      const t = ctx.currentTime;
+      noise(t, 0.08, 0.26, 2600, sfxBus);
+      tone(t, 780, 0.16, 0.18, 'square', sfxBus, 520);
+    },
+    gasp() {   // 息切れ
+      if (!ctx || !enabled) return;
+      noise(ctx.currentTime, 0.28, 0.13, 500, sfxBus);
+    },
+    warn() {   // 残り60秒・30秒
+      if (!ctx || !enabled) return;
+      const t = ctx.currentTime;
+      tone(t, 220, 0.45, 0.22, 'sawtooth', sfxBus, 165);
+    },
+    tick() {   // 残り10秒からの秒読み
+      if (!ctx || !enabled) return;
+      tone(ctx.currentTime, 1900, 0.035, 0.20, 'square', sfxBus);
+    },
+    win() {
+      if (!ctx || !enabled) return;
+      const t = ctx.currentTime;
+      [392, 494, 587, 784].forEach((f, i) =>
+        tone(t + i * 0.11, f, 0.30, 0.24, 'triangle', sfxBus));
+    },
+    lose() {
+      if (!ctx || !enabled) return;
+      const t = ctx.currentTime;
+      [392, 349, 294, 220].forEach((f, i) =>
+        tone(t + i * 0.16, f, 0.42, 0.24, 'sawtooth', sfxBus));
+    },
+  };
+
+  return Object.assign(sfx, {
+    // 最初のユーザー操作で初めて鳴らせるようになる（ブラウザの自動再生制限）
+    start() {
+      if (!ensure()) return;
+      if (ctx.state === 'suspended') ctx.resume();
+      if (!timer) {
+        nextTime = ctx.currentTime + 0.06;
+        timer = setInterval(schedule, 25);
+      }
+    },
+    // 毎フレーム、いまの緊張度を渡す
+    set(i, p) { intensity = i; pressure = p; },
+    music(on) {
+      if (!ctx) return;
+      musicBus.gain.setTargetAtTime(on ? 0.45 : 0.0001, ctx.currentTime, 0.08);
+    },
+    toggle() {
+      enabled = !enabled;
+      if (ctx) master.gain.setTargetAtTime(enabled ? 0.85 : 0.0001, ctx.currentTime, 0.05);
+      return enabled;
+    },
+    get on() { return enabled; },
+  });
+})();
 
 // ---------------------------------------------------------------------------
 // 入力
 // ---------------------------------------------------------------------------
+// ブラウザの自動再生制限により、最初のユーザー操作までは音を出せない
+const soundBtn = document.getElementById('sound');
+let audioStarted = false;
+function unlockAudio() { audioStarted = true; Snd.start(); }
+for (const ev of ['keydown', 'pointerdown', 'touchstart']) {
+  addEventListener(ev, unlockAudio, { once: true, passive: true });
+}
+function toggleSound() {
+  // まだ一度も鳴っていないなら、最初の一押しは「鳴らす」だけにする
+  if (!audioStarted) { unlockAudio(); return; }
+  const on = Snd.toggle();
+  soundBtn.textContent = on ? '♪ 音 ON' : '♪ 音 OFF';
+  soundBtn.classList.toggle('off', !on);
+}
+soundBtn.addEventListener('click', e => { e.preventDefault(); toggleSound(); });
+
 const keys = Object.create(null);
 addEventListener('keydown', e => {
   keys[e.code] = true;
   if (e.code === 'KeyR') reset();
+  if (e.code === 'KeyM') toggleSound();
   if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Space'].includes(e.code)) e.preventDefault();
 });
 addEventListener('keyup', e => { keys[e.code] = false; });
@@ -621,6 +852,7 @@ function updateAlly(dt) {
     if (!t.jailed && t.stun <= 0 && t.immune <= 0 &&
         Math.hypot(t.x - ally.x, t.y - ally.y) < T.catchDist) {
       t.stun = T.pinDuration;
+      Snd.pin();
       effects.push({ x: t.x, y: t.y, life: 0.5, max: 0.5 });
     }
   } else {
@@ -644,6 +876,8 @@ function updateAlly(dt) {
 function jail(t) {
   t.jailed = true;
   t.mark = 0;
+  t.stun = 0;
+  Snd.capture();
   effects.push({ x: t.x, y: t.y, life: 0.5, max: 0.5 });
   const slot = thieves.filter(o => o.jailed).length - 1;
   const c = JAIL.c0 + (slot % 2), r = JAIL.r0 + Math.floor(slot / 2);
@@ -680,8 +914,30 @@ function update(dt) {
   for (const e of effects) e.life -= dt;
   effects = effects.filter(e => e.life > 0);
 
-  if (thieves.every(t => t.jailed)) phase = 'win';
-  else if (timeLeft <= 0) { timeLeft = 0; phase = 'lose'; }
+  // --- 音の契機。状態が切り替わった瞬間だけ鳴らす ---
+  const visNow = thieves.filter(t => !t.jailed && areaOf(t.x, t.y) === copArea).length;
+  if (visNow > cue.visible) Snd.spot();
+  cue.visible = visNow;
+
+  const alertNow = ally.state === 'alert';
+  if (alertNow && !cue.allyAlert) Snd.allyAlert();
+  cue.allyAlert = alertNow;
+
+  if (cop.exhausted && !cue.exhausted) Snd.gasp();
+  cue.exhausted = cop.exhausted;
+
+  const sec = Math.ceil(timeLeft);
+  if (sec !== cue.sec) {
+    if (timeLeft <= 10) Snd.tick();
+    else if (sec === 30 || sec === 60) Snd.warn();
+    cue.sec = sec;
+  }
+
+  // 緊張度：視認中＝2、仲間が警戒中＝1、それ以外＝0。時間が減るほど速くなる。
+  Snd.set(visNow > 0 ? 2 : alertNow ? 1 : 0, 1 - timeLeft / T.timeLimit);
+
+  if (thieves.every(t => t.jailed)) { phase = 'win'; Snd.music(false); Snd.win(); }
+  else if (timeLeft <= 0) { timeLeft = 0; phase = 'lose'; Snd.music(false); Snd.lose(); }
 }
 
 // ---------------------------------------------------------------------------
@@ -917,7 +1173,7 @@ function drawHUD(copArea) {
   ctx.fillStyle = '#4d566d';
   ctx.font = '11px system-ui';
   ctx.textAlign = 'right';
-  ctx.fillText('ケイドロ プロトタイプ v0.2', FIELD_W - 20, 28);
+  ctx.fillText('ケイドロ プロトタイプ v0.3', FIELD_W - 20, 28);
 }
 
 function drawResult() {
